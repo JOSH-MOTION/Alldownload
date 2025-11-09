@@ -1,84 +1,102 @@
 import type { MediaInfo, Platform, DownloadOption } from '../types';
 
 // ──────────────────────────────────────────────────────────────────────
-// YOUTUBE – Multiple Invidious Mirrors + yt-dlp-style fallback
+// YOUTUBE – Local Backend with ytdl-core + Public API Fallback
 // ──────────────────────────────────────────────────────────────────────
-const INV_MIRRORS = [
-  'https://invidious.snopyta.org',
-  'https://y.com.sb',
-  'https://inv.riverside.rocks',
-  'https://invidious.fdn.fr',
-  'https://invidious.tiekoetter.com',
-];
 
-const getYoutubeVideoId = (url: string): string | null => {
-  const patterns = [
-    /(?:youtube\.com\/(?:embed\/|watch\?v=)|youtu\.be\/)([a-zA-Z0-9_-]{11})/,
-    /youtube\.com\/shorts\/([a-zA-Z0-9_-]{11})/,
-  ];
-  for (const p of patterns) {
-    const m = url.match(p);
-    if (m) return m[1];
-  }
-  return null;
+/**
+ * Fallback function to fetch YouTube info from a public Invidious API.
+ * This is used if the local backend service is not available.
+ */
+const fetchYouTubeInfoFromInvidious = async (url: string): Promise<MediaInfo> => {
+    const videoIdMatch = url.match(/(?:v=|\/)([0-9A-Za-z_-]{11}).*/);
+    if (!videoIdMatch) throw new Error('Invalid YouTube URL for fallback API');
+    const videoId = videoIdMatch[1];
+    
+    // A list of public Invidious instances to try
+    const invidiousInstances = [
+      'https://vid.puffyan.us',
+      'https://invidious.projectsegfau.lt',
+      'https://invidious.kavin.rocks',
+      'https://invidious.io.lol',
+    ];
+
+    for (const instance of invidiousInstances) {
+        try {
+            const apiUrl = `${instance}/api/v1/videos/${videoId}`;
+            // Use a short timeout for each public API attempt
+            const res = await fetch(apiUrl, { signal: AbortSignal.timeout(5000) });
+            if (!res.ok) continue; // Try next instance if this one fails
+            
+            const data = await res.json();
+            
+            if (!data.formatStreams || data.formatStreams.length === 0) continue;
+
+            const downloadOptions: DownloadOption[] = data.formatStreams
+                .filter((f: any) => f.url && f.qualityLabel)
+                .map((f: any) => ({
+                    quality: f.qualityLabel,
+                    format: f.container || 'mp4',
+                    url: f.url,
+                    size: f.size ? `${(f.size / 1024 / 1024).toFixed(1)} MB` : undefined,
+                }));
+                
+            if (downloadOptions.length === 0) continue; // No downloadable formats
+
+            return {
+                title: data.title,
+                thumbnail: data.videoThumbnails?.find((t: any) => t.quality === 'medium')?.url || data.videoThumbnails?.[0]?.url,
+                duration: new Date(data.lengthSeconds * 1000).toISOString().substr(11, 8),
+                author: data.author,
+                platform: 'YouTube',
+                url,
+                description: data.description,
+                downloadOptions,
+            };
+        } catch (error) {
+            console.warn(`[Invidious Fallback] Failed to fetch from ${instance}`, error);
+            // Continue to the next instance
+        }
+    }
+    
+    throw new Error('The local service is down and all public YouTube APIs failed. Please try again later.');
 };
 
+/**
+ * Main function to fetch YouTube info.
+ * It first tries the local backend service for reliability and falls back to public APIs if needed.
+ */
 const fetchYouTubeInfo = async (url: string): Promise<MediaInfo> => {
-  const videoId = getYoutubeVideoId(url);
-  if (!videoId) throw new Error('Invalid YouTube URL');
-
-  let data: any = null;
-  for (const base of INV_MIRRORS) {
+    // The preferred method: a local backend service running on port 3001
+    // that uses ytdl-core for robust fetching.
+    const backendApi = `http://localhost:3001/api/youtube-info?url=${encodeURIComponent(url)}`;
+    
     try {
-      const api = `${base}/api/v1/videos/${videoId}?fields=title,videoThumbnails,author,description,lengthSeconds,formatStreams,adaptiveFormats`;
-      const res = await fetch(api, { signal: AbortSignal.timeout(8000) });
-      if (res.ok) {
-        data = await res.json();
-        break;
-      }
-    } catch (_) { /* try next */ }
-  }
+        // Use a short timeout to quickly determine if the local service is available
+        const res = await fetch(backendApi, { signal: AbortSignal.timeout(3000) });
+        
+        if (!res.ok) {
+            const errorData = await res.json().catch(() => ({ 
+                error: 'The backend service sent an invalid response.' 
+            }));
+            throw new Error(errorData.error || `⚠️ Backend service failed with status ${res.status}.`);
+        }
+        
+        console.log("[YouTube] Fetched from local backend successfully.");
+        const data: MediaInfo = await res.json();
+        return data;
+    } catch (err: any) {
+        console.warn('[YouTube] Local backend failed, attempting public API fallback.', err.message);
+        
+        // Only trigger fallback on network errors, not on specific backend errors (like 400s)
+        if (err.name === 'AbortError' || err.message.includes('Failed to fetch')) {
+             console.log("[YouTube] Using public Invidious API as a fallback.");
+             return await fetchYouTubeInfoFromInvidious(url);
+        }
 
-  if (!data) throw new Error('All YouTube mirrors failed. Try again later.');
-
-  const streams: any[] = [...(data.formatStreams || []), ...(data.adaptiveFormats || [])];
-  const videoStreams = streams.filter(s => s.type?.includes('video/mp4') && s.qualityLabel);
-  const audioStreams = streams.filter(s => s.type?.includes('audio'));
-  const bestAudio = audioStreams.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
-
-  const options: DownloadOption[] = videoStreams.map((s: any) => ({
-    quality: s.qualityLabel || `${s.height}p`,
-    format: 'mp4',
-    url: s.url,
-    size: s.contentLength ? `${(Number(s.contentLength) / 1024 / 1024).toFixed(1)} MB` : undefined,
-  }));
-
-  if (bestAudio) {
-    options.push({
-      quality: 'audio',
-      format: 'm4a',
-      url: bestAudio.url,
-      size: bestAudio.contentLength ? `${(Number(bestAudio.contentLength) / 1024 / 1024).toFixed(1)} MB` : undefined,
-    });
-  }
-
-  if (options.length === 0) throw new Error('No downloadable streams (private/live?)');
-
-  options.sort((a, b) => {
-    const order = ['2160p','1440p','1080p','720p','480p','360p','240p','144p','audio'];
-    return order.indexOf(a.quality) - order.indexOf(b.quality);
-  });
-
-  return {
-    title: data.title || 'YouTube Video',
-    thumbnail: data.videoThumbnails?.find((t: any) => t.quality === 'maxresdefault')?.url || data.videoThumbnails?.[0]?.url,
-    duration: data.lengthSeconds ? new Date(data.lengthSeconds * 1000).toISOString().substr(11, 8) : 'LIVE',
-    author: data.author,
-    platform: 'YouTube',
-    url: `https://youtube.com/watch?v=${videoId}`,
-    description: data.description?.slice(0, 500),
-    downloadOptions: options,
-  };
+        // Re-throw specific, user-friendly errors from the backend (e.g., "Invalid YouTube link")
+        throw new Error(err.message);
+    }
 };
 
 // ──────────────────────────────────────────────────────────────────────
