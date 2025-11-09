@@ -1,0 +1,5 @@
+{
+  "name": "Copy of AllDownloader",
+  "description": "A sleek web application that allows users to paste a link from any major social media platform and download the associated video or image directly onto their device. It features automatic platform detection, content previews, quality selection, and a download history.",
+  "requestFramePermissions": []
+}
